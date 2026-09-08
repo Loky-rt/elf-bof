@@ -1,0 +1,5 @@
+lib
+*.o
+bof-loader/bof_loader
+*.swp
+*.swo
