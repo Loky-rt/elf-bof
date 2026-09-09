@@ -1,5 +1,6 @@
 lib
 *.o
 bof-loader/bof_loader
+bof-loader/bof_loader_arm64
 *.swp
 *.swo
