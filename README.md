@@ -20,6 +20,7 @@ The included **BOF Loader** (`bof-loader/`) is a standalone interactive shell th
 - **Custom symbol registration** — expose agent-internal functions to BOFs
 - **Thread-safe output** — `__thread` buffers prevent interference between concurrent BOFs
 - **OPSEC cleanup** — zero memory and deep-copy sensitive data before freeing
+- **Dynamic libc resolution** — BOFs can call any libc function via `LIBC$` prefix without dlsym
 
 ---
 
@@ -131,8 +132,9 @@ The loader (`elf_bof.c`) performs these steps for each BOF execution:
 │    For each symbol in .symtab:
 │      - Local/defined: compute address from section base
 │      - Undefined (Ax*/Beacon*): look up in bof_resolve_symbol()
-│        → First checks custom symbol table (nax_bof_resolve_custom)
-│        → Then checks base API table (bof_api_table)
+│        → Layer 1: custom symbol table (nax_bof_resolve_custom)
+│        → Layer 2: base API table (bof_api_table)
+│        → Layer 3: LIBC$ runtime resolution (in-memory .gnu_hash walk)
 │      - Unresolved: abort with "Unresolved: <name>" error
 │
 ├─ Step 5: Apply relocations
@@ -166,8 +168,8 @@ BOF error: Unresolved: dlopen
 | Symptom | Cause | Fix |
 |---|---|---|
 | `Unresolved: dlopen` | BOF uses `dlopen()` directly | Not supported — use Ax* wrappers only |
-| `Unresolved: printf` | BOF calls libc directly | Use `BeaconPrintf()` instead |
-| `Unresolved: malloc` | BOF calls libc directly | Use `AxMalloc()` instead |
+| `Unresolved: printf` | BOF calls libc directly | Use `BeaconPrintf()` or `LIBC$printf` |
+| `Unresolved: malloc` | BOF calls libc directly | Use `AxMalloc()` or `LIBC$malloc` |
 | `Unresolved: MyFunc` | BOF calls a custom function | Register with `nax_bof_register_symbol()` |
 | `relocation failed` | Unsupported relocation type | Check compiler flags: `-fPIC -c` required |
 
@@ -461,6 +463,107 @@ BOF calls AgentCrc32()
 
 - Maximum 64 custom symbols. Register before spawning any BOF threads.
 - The agent must be linked with -lz to provide the underlying zlib implementation (for this example)
+
+---
+
+## Dynamic libc Resolution (`LIBC$` prefix)
+
+BOFs can call **any function exported by the host's libc** at runtime using the `LIBC$` prefix. The SDK resolves these symbols by walking libc's `.gnu_hash` table directly in memory — no `dlsym`, no `-ldl` dependency.
+
+### How it works
+
+```
+BOF calls LIBC$opendir("/etc")
+  └─ bof_resolve_symbol("LIBC$opendir")
+       ├─ Layer 1: custom table → miss
+       ├─ Layer 2: Ax* table → miss
+       └─ Layer 3: strip "LIBC$" → "opendir"
+            ├─ _find_libc_base()
+            │    → parse /proc/self/maps
+            │    → find first mapping with offset 00000000 containing "libc"
+            │    → extract base address (cached after first call)
+            │
+            └─ _resolve_from_libc("opendir")
+                 → validate ELF magic at base
+                 → walk PT_DYNAMIC → locate .dynsym + .dynstr + .gnu_hash
+                 → compute GNU hash of "opendir"
+                 → bloom filter check → bucket lookup → chain walk
+                 → hash match → strcmp confirm → return address
+```
+
+After the first call, the libc base address is cached. Subsequent resolutions only perform the hash walk (~nanoseconds).
+
+### Usage in a BOF
+
+Declare external functions with the `LIBC$` prefix. Use `void *` instead of opaque types like `FILE *` (libc headers are not available in BOFs):
+
+```c
+#include "bof_api.h"
+
+extern int    LIBC$getpid(void);
+extern int    LIBC$getuid(void);
+extern char  *LIBC$getenv(const char *);
+extern char  *LIBC$getcwd(char *, int);
+extern int    LIBC$uname(void *);
+extern int    LIBC$access(const char *, int);
+extern void  *LIBC$opendir(const char *);
+extern void  *LIBC$readdir(void *);
+extern int    LIBC$closedir(void *);
+extern void  *LIBC$fopen(const char *, const char *);
+extern char  *LIBC$fgets(char *, int, void *);
+extern int    LIBC$fclose(void *);
+extern long   LIBC$sysconf(int);
+extern double LIBC$strtod(const char *, char **);
+extern long   LIBC$time(long *);
+
+void go(char *args, int args_len) {
+    BeaconPrintf(CALLBACK_OUTPUT, "PID=%d UID=%d\n", LIBC$getpid(), LIBC$getuid());
+
+    char *home = LIBC$getenv("HOME");
+    BeaconPrintf(CALLBACK_OUTPUT, "HOME=%s\n", home ? home : "(null)");
+
+    void *dir = LIBC$opendir("/tmp");
+    if (dir) {
+        void *ent = LIBC$readdir(dir);
+        if (ent) {
+            char *name = (char *)ent + 19; /* d_name offset in dirent64 */
+            BeaconPrintf(CALLBACK_OUTPUT, "first: %s\n", name);
+        }
+        LIBC$closedir(dir);
+    }
+}
+```
+
+The `RTLD$` prefix is also supported and behaves identically to `LIBC$`.
+
+### Important: BOF type declarations
+
+Since BOFs don't have access to libc headers, opaque types must be declared as `void *`:
+
+| libc type | BOF declaration |
+|---|---|
+| `FILE *` | `void *` |
+| `DIR *` | `void *` |
+| `struct dirent *` | `void *` (access fields by byte offset) |
+| `struct utsname *` | `void *` or `char[512]` buffer |
+
+### OPSEC considerations
+
+| Aspect | Ax\* Wrappers | LIBC$ Dynamic |
+|---|---|---|
+| **Resolve method** | Compile-time table lookup | Runtime `/proc/self/maps` + `.gnu_hash` walk |
+| **dlsym usage** | None | None |
+| **Hooked APIs** | None (direct syscalls for many Ax\* functions) | The resolved libc function itself may be hooked by EDR |
+| **String exposure** | Function names in SDK's `.rodata` only | Function name appears briefly on stack during hash comparison |
+| **/proc access** | None | Reads `/proc/self/maps` once (cached) |
+| **Recommendation** | Preferred for stealth operations | Use when Ax\* wrappers don't cover the needed function |
+
+The Ax\* wrappers provide better OPSEC because many are implemented as direct syscalls, bypassing libc entirely. `LIBC$` resolves to the actual libc function which may be hooked by security tools. Use `LIBC$` when you need a function not available in the Ax\* table.
+
+### Current limitations
+
+- **libc only**: The resolver currently searches only in `libc.so`. Functions from other shared libraries (`libm.so`, `librt.so`, etc.) are not resolved. Support for resolving symbols across all loaded libraries is planned for a future release.
+- **No TLS-dependent functions**: Some libc functions that depend on thread-local storage initialization may behave unexpectedly when called from a BOF context.
 
 ---
 
