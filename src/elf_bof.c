@@ -8,13 +8,16 @@
  */
 
 #include "elf_bof.h"
-
+#include "bof_deps.h"
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdint.h>
 #include <sys/mman.h>
 #include <unistd.h>
+
+extern int bof_deps_prepare(const uint8_t *elf_data, uint32_t elf_size,
+                            char *err_buf, int err_sz);
 
 /* ── Extern from bof_api.c ── */
 extern void        bof_output_init(void);
@@ -74,8 +77,29 @@ static int validate_elf(const Elf64_Ehdr *e, uint32_t sz) {
     if (e->e_machine != EM_AARCH64) return -1;
 #endif
     if (e->e_shoff == 0 || e->e_shnum == 0) return -1;
+    if (e->e_shentsize != sizeof(Elf64_Shdr)) return -1;
     if (e->e_shoff + (uint64_t)e->e_shnum * e->e_shentsize > sz) return -1;
     return 0;
+}
+
+/* ── Validación de nombres en .strtab ──
+ *
+ * Devuelve la longitud del nombre en `strtab + off`, o 0 si el
+ * offset está fuera del strtab o no encuentra NUL antes del final.
+ *
+ * CRÍTICO: llamar a strcmp/strlen directamente sobre un puntero
+ * calculado como strtab + st_name sin validar el rango hace que
+ * la implementación SIMD de libc (AVX2/AVX512) lea 32-64 bytes
+ * fuera del buffer → SIGSEGV. Esta función garantiza que el nombre
+ * está completo dentro del strtab antes de permitir cualquier
+ * comparación. */
+static size_t _strtab_name_len(const char *strtab, size_t strtab_size,
+                               uint32_t off) {
+    if (!strtab || off >= strtab_size) return 0;
+    for (size_t i = off; i < strtab_size; i++) {
+        if (strtab[i] == '\0') return i - off;
+    }
+    return 0;   /* sin NUL → corrupto */
 }
 
 /* ── Allocate all sections in a single contiguous mmap ── */
@@ -170,9 +194,14 @@ static loaded_section_t *find_section(loaded_section_t *s, int n, int shndx) {
     return NULL;
 }
 
-/* ── Resolve symbols ── */
-
-static int resolve_symbols(const Elf64_Sym *sym, int nsym, const char *str,
+/* ── Resolve symbols ──
+ *
+ * FIX: recibe el tamaño del strtab para validar cada st_name antes
+ * de leerlo o pasarlo al resolver. Sin esto, un .o malformado o
+ * trimeado puede hacer que strcmp/strlen de libc lean fuera del
+ * mmap del BOF y maten el proceso. */
+static int resolve_symbols(const Elf64_Sym *sym, int nsym,
+                           const char *str, size_t str_size,
                            loaded_section_t *secs, int nsecs,
                            sym_value_t *vals, bof_arena_t *arena,
                            char *err_sym, int err_sz) {
@@ -199,16 +228,44 @@ static int resolve_symbols(const Elf64_Sym *sym, int nsym, const char *str,
             }
             continue;
         }
-        /* Undefined — resolve from BOF API table */
-        const char *name = str + sym[i].st_name;
-        if (sym[i].st_name == 0 || name[0] == '\0') {
+        /* Undefined — resolver desde el SDK */
+        if (sym[i].st_name == 0) {
             vals[i].resolved = 1;
             continue;
         }
+
+        /* FIX: validar st_name contra el tamaño del strtab antes de
+         * tocar `str + st_name`. Si el nombre no tiene NUL dentro
+         * del strtab, el .o está corrupto → abortar limpiamente. */
+        if (_strtab_name_len(str, str_size, sym[i].st_name) == 0) {
+            snprintf(err_sym, err_sz, "Corrupt symbol name at index %d", i);
+            return -1;
+        }
+
+        const char *name = str + sym[i].st_name;
+        if (name[0] == '\0') {
+            vals[i].resolved = 1;
+            continue;
+        }
+
         void *func = bof_resolve_symbol(name);
         if (func) {
+            /* Every resolved symbol is reached through a trampoline in
+             * the BOF's own arena. This keeps R_X86_64_PLT32 /
+             * R_X86_64_PC32 displacements inside 32 bits even when the
+             * target DSO is mapped more than 2 GB away. If the
+             * trampoline pool is exhausted we must NOT fall back to
+             * the raw target address: a PLT32 relocation against a
+             * far-away address silently truncates and the BOF jumps to
+             * garbage. Fail cleanly instead. */
             void *tramp = write_trampoline(arena, (uint64_t)(uintptr_t)func);
-            vals[i].value = (uint64_t)(uintptr_t)(tramp ? tramp : func);
+            if (!tramp) {
+                snprintf(err_sym, err_sz,
+                         "Trampoline pool exhausted (%d slots) resolving '%s'",
+                         BOF_MAX_TRAMPOLINES, name);
+                return -1;
+            }
+            vals[i].value = (uint64_t)(uintptr_t)tramp;
             vals[i].section = -1;
             vals[i].resolved = 1;
         } else if (ELF64_ST_BIND(sym[i].st_info) == STB_WEAK) {
@@ -350,16 +407,120 @@ static void cleanup_arena(bof_arena_t *arena) {
     }
 }
 
-/* ── Find entry point ── */
-
-static bof_entry_t find_entry(const char *name, const Elf64_Sym *sym, int nsym,
-                              const char *str, sym_value_t *vals) {
+/* ── Find entry point ──
+ *
+ * FIX: recibe strtab_size y valida st_name antes de cualquier
+ * comparación. strcmp sobre un nombre corrupto es una de las causas
+ * del SIGSEGV en libc con AVX2. */
+static bof_entry_t find_entry(const char *name,
+                              const Elf64_Sym *sym, int nsym,
+                              const char *str, size_t str_size,
+                              sym_value_t *vals) {
     for (int i = 0; i < nsym; i++) {
         if (sym[i].st_shndx == SHN_UNDEF) continue;
+        if (sym[i].st_name == 0) continue;
+        if (_strtab_name_len(str, str_size, sym[i].st_name) == 0) continue;
         if (strcmp(str + sym[i].st_name, name) == 0 && vals[i].resolved)
             return (bof_entry_t)(uintptr_t)vals[i].value;
     }
     return NULL;
+}
+
+
+/* ── Collect LIBXXX$ dependency hints from .symtab ──
+ *
+ * Walks the BOF's symbol table. For every STB_GLOBAL / STB_WEAK
+ * undefined symbol whose name contains a '$', extracts the prefix
+ * before the '$', lowercases it, and adds it to the output list if
+ * not already present.
+ *
+ * Ignores:
+ *   - local symbols
+ *   - defined symbols
+ *   - symbols without '$'
+ *   - empty prefixes ("$foo")
+ *
+ * Returns 0 on success, -1 on malformed ELF.
+ *
+ * This function is used by bof_deps_prepare() to learn which shared
+ * libraries the BOF needs. It must run before any symbol resolution,
+ * because resolution failures for LIBXXX$ are exactly what it
+ * prevents. */
+int elf_bof_collect_deps(const uint8_t *elf, uint32_t sz,
+                         char (*hints)[48], int max_hints, int *out_count) {
+    *out_count = 0;
+    if (!elf || sz < sizeof(Elf64_Ehdr) || !hints || max_hints <= 0)
+        return -1;
+
+    const Elf64_Ehdr *eh = (const Elf64_Ehdr *)elf;
+    if (validate_elf(eh, sz) != 0) return -1;
+
+    const Elf64_Shdr *shdrs = (const Elf64_Shdr *)(elf + eh->e_shoff);
+
+    const Elf64_Sym *symtab = NULL;
+    const char       *strtab = NULL;
+    size_t            strtab_size = 0;
+    int               nsym = 0;
+
+    for (int i = 0; i < eh->e_shnum; i++) {
+        if (shdrs[i].sh_type != SHT_SYMTAB) continue;
+        if (shdrs[i].sh_offset > sz ||
+            shdrs[i].sh_size > (uint64_t)sz - shdrs[i].sh_offset ||
+            shdrs[i].sh_entsize != sizeof(Elf64_Sym))
+            return -1;
+        symtab = (const Elf64_Sym *)(elf + shdrs[i].sh_offset);
+        nsym   = (int)(shdrs[i].sh_size / shdrs[i].sh_entsize);
+        int stridx = (int)shdrs[i].sh_link;
+        if (stridx < 0 || stridx >= eh->e_shnum) return -1;
+        if (shdrs[stridx].sh_offset > sz ||
+            shdrs[stridx].sh_size > (uint64_t)sz - shdrs[stridx].sh_offset)
+            return -1;
+        strtab      = (const char *)(elf + shdrs[stridx].sh_offset);
+        strtab_size = (size_t)shdrs[stridx].sh_size;
+        break;
+    }
+    if (!symtab || !strtab || strtab_size == 0 || nsym == 0) return -1;
+
+    for (int i = 0; i < nsym; i++) {
+        if (symtab[i].st_shndx != SHN_UNDEF) continue;
+        unsigned bind = ELF64_ST_BIND(symtab[i].st_info);
+        if (bind != STB_GLOBAL && bind != STB_WEAK) continue;
+
+        size_t name_len = _strtab_name_len(strtab, strtab_size,
+                                           symtab[i].st_name);
+        if (name_len == 0) continue;   /* corrupt or empty, skip */
+
+        const char *name = strtab + symtab[i].st_name;
+        const char *dollar = strchr(name, '$');
+        if (!dollar || dollar == name) continue;
+
+        size_t plen = (size_t)(dollar - name);
+        if (plen >= 48) continue;      /* too long to be a real lib hint */
+
+        /* Normalise to lowercase for dedupe and lookup. */
+        char hint[48];
+        for (size_t k = 0; k < plen; k++) {
+            char c = name[k];
+            hint[k] = (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c;
+        }
+        hint[plen] = '\0';
+
+        if (strcmp(hint, "rtld") == 0) continue;
+        if (strcmp(hint, "libc") == 0) continue;
+
+        /* Dedupe. */
+        int dup = 0;
+        for (int h = 0; h < *out_count; h++) {
+            if (strcmp(hints[h], hint) == 0) { dup = 1; break; }
+        }
+        if (dup) continue;
+
+        if (*out_count >= max_hints) return -1;   /* table full */
+        strcpy(hints[*out_count], hint);
+        (*out_count)++;
+    }
+
+    return 0;
 }
 
 /* ══════════════════════════════════════════════════════════════
@@ -396,28 +557,47 @@ int nax_bof_execute(const uint8_t *elf_data, uint32_t elf_size,
         return -1;
     }
 
+    /* Step 2a: Pre-validate and pre-load LIBXXX$ dependencies.
+     * Rejects the BOF before any of its code runs if a required library
+     * cannot be satisfied. Idempotent: safe to call twice. */
+    {
+        char dep_err[256];
+        if (bof_deps_prepare(elf_data, elf_size, dep_err, sizeof(dep_err))
+                != BOF_DEPS_OK) {
+            char msg[320];
+            snprintf(msg, sizeof(msg), "BOF error: %s",
+                     dep_err[0] ? dep_err : "unsatisfied library dependency");
+            *output = strdup(msg);
+            *output_len = (uint32_t)strlen(*output);
+            return -1;
+        }
+    }
+
     /* Step 2: Parse section headers */
     const Elf64_Shdr *shdrs = (const Elf64_Shdr *)(elf_data + ehdr->e_shoff);
     const Elf64_Sym *symtab = NULL;
     const char *strtab = NULL;
+    size_t strtab_size = 0;
     int nsym = 0;
 
     for (int i = 0; i < ehdr->e_shnum; i++) {
         if (shdrs[i].sh_type == SHT_SYMTAB) {
             if (shdrs[i].sh_offset > elf_size ||
                 shdrs[i].sh_size > (uint64_t)elf_size - shdrs[i].sh_offset ||
-                shdrs[i].sh_entsize == 0) break;
+                shdrs[i].sh_entsize != sizeof(Elf64_Sym)) break;
             symtab = (const Elf64_Sym *)(elf_data + shdrs[i].sh_offset);
             nsym   = (int)(shdrs[i].sh_size / shdrs[i].sh_entsize);
             int stridx = (int)shdrs[i].sh_link;
-            if (stridx < ehdr->e_shnum &&
+            if (stridx >= 0 && stridx < ehdr->e_shnum &&
                 shdrs[stridx].sh_offset <= elf_size &&
-                shdrs[stridx].sh_size <= (uint64_t)elf_size - shdrs[stridx].sh_offset)
-                strtab = (const char *)(elf_data + shdrs[stridx].sh_offset);
+                shdrs[stridx].sh_size <= (uint64_t)elf_size - shdrs[stridx].sh_offset) {
+                strtab      = (const char *)(elf_data + shdrs[stridx].sh_offset);
+                strtab_size = (size_t)shdrs[stridx].sh_size;
+            }
             break;
         }
     }
-    if (!symtab || !strtab || nsym == 0) {
+    if (!symtab || !strtab || strtab_size == 0 || nsym == 0) {
         *output = strdup("BOF error: no symbol table");
         *output_len = (uint32_t)strlen(*output);
         return -1;
@@ -439,7 +619,8 @@ int nax_bof_execute(const uint8_t *elf_data, uint32_t elf_size,
         return -1;
     }
     errbuf[0] = '\0';
-    if (resolve_symbols(symtab, nsym, strtab, sections, nsecs, vals, &arena,
+    if (resolve_symbols(symtab, nsym, strtab, strtab_size,
+                        sections, nsecs, vals, &arena,
                         errbuf, sizeof(errbuf)) != 0) {
         free(vals); cleanup_arena(&arena);
         char msg[320];
@@ -455,7 +636,8 @@ int nax_bof_execute(const uint8_t *elf_data, uint32_t elf_size,
         loaded_section_t *target = find_section(sections, nsecs, (int)shdrs[i].sh_info);
         if (!target) continue;
         if (shdrs[i].sh_offset > elf_size ||
-            shdrs[i].sh_size > (uint64_t)elf_size - shdrs[i].sh_offset) continue;
+            shdrs[i].sh_size > (uint64_t)elf_size - shdrs[i].sh_offset ||
+            shdrs[i].sh_entsize != sizeof(Elf64_Rela)) continue;
         const Elf64_Rela *relas = (const Elf64_Rela *)(elf_data + shdrs[i].sh_offset);
         int nrelas = (int)(shdrs[i].sh_size / sizeof(Elf64_Rela));
         int ret;
@@ -484,7 +666,8 @@ int nax_bof_execute(const uint8_t *elf_data, uint32_t elf_size,
     }
 
     /* Step 7: Find entry point */
-    bof_entry_t entry = find_entry(entry_name, symtab, nsym, strtab, vals);
+    bof_entry_t entry = find_entry(entry_name, symtab, nsym,
+                                   strtab, strtab_size, vals);
     if (!entry) {
         free(vals); cleanup_arena(&arena);
         char msg[320];

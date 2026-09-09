@@ -11,8 +11,10 @@
 # Dependencies:
 #   sudo apt install gcc-i686-linux-gnu gcc-aarch64-linux-gnu gcc-arm-linux-gnueabihf
 
-CFLAGS = -O2 -Wall -Wextra -Wno-unused-parameter -fPIC -Iinclude
-SRCS   = src/elf_bof.c src/bof_async.c src/bof_api.c src/nax_bof_sdk.c
+BOF_DEPS_ALLOW_DLOPEN ?= 1
+
+CFLAGS = -O2 -Wall -Wextra -Wno-unused-parameter -fPIC -Iinclude -DBOF_DEPS_ALLOW_DLOPEN=$(BOF_DEPS_ALLOW_DLOPEN)
+SRCS   = src/elf_bof.c src/bof_async.c src/bof_api.c src/nax_bof_sdk.c src/bof_deps.c
 
 .PHONY: all x64 arm64 clean
 

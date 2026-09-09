@@ -4,12 +4,16 @@
 
 #include "bof_async.h"
 #include "elf_bof.h"
-
+#include "bof_deps.h"
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <stdio.h>
 #include <poll.h>
+
+extern int bof_deps_prepare(const uint8_t *elf_data, uint32_t elf_size,
+                            char *err_buf, int err_sz);
+extern int g_bof_deps_allow_dlopen;   /* only if you want to log it */
 
 static async_job_t g_jobs[MAX_ASYNC_JOBS];
 static pthread_mutex_t g_jobs_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -99,7 +103,63 @@ int nax_async_start(uint32_t task_id,
     /* Validate inputs — if we return a valid job ID, the job owns all its data */
     if (!bof_data || bof_size == 0) return -1;
 
+    /* Pre-validate LIBXXX$ dependencies before touching any job slot.
+     * If the BOF requires a library that cannot be loaded, we do not
+     * want to burn a slot on it. Instead we stage the failure as a
+     * COMPLETED job with NAX_STATUS_ERR so the operator receives the
+     * error through the normal drain() channel, indistinguishable from
+     * any other BOF runtime failure. */
+    char dep_err[256] = {0};
+    int  dep_rc = bof_deps_prepare(bof_data, bof_size,
+                                   dep_err, sizeof(dep_err));
+
     pthread_mutex_lock(&g_jobs_lock);
+
+    if (dep_rc != BOF_DEPS_OK) {
+        /* Find a free slot to stage the error. If none is free, fall
+         * back to returning -1: we cannot queue the diagnostic. */
+        int idx = -1;
+        for (int i = 0; i < MAX_ASYNC_JOBS; i++) {
+            if (g_jobs[i].state == NAX_JOB_FREE) { idx = i; break; }
+        }
+        if (idx < 0) {
+            pthread_mutex_unlock(&g_jobs_lock);
+            return -1;
+        }
+
+        async_job_t *job = &g_jobs[idx];
+        memset(job, 0, sizeof(*job));
+        job->stop_pipe[0] = -1;
+        job->stop_pipe[1] = -1;
+
+        /* Build the diagnostic message. Prepend a stable marker so the
+         * operator can distinguish dependency failures from ordinary
+         * BOF errors if they care. */
+        char *msg = NULL;
+        int   msg_len = 0;
+        {
+            const char *detail = dep_err[0] ? dep_err
+                                            : "unsatisfied library dependency";
+            /* Message shape: "BOF dependency error: <detail>\n" */
+            size_t need = strlen(detail) + 32;
+            msg = (char *)malloc(need);
+            if (!msg) {
+                pthread_mutex_unlock(&g_jobs_lock);
+                return -1;
+            }
+            msg_len = snprintf(msg, need, "BOF dependency error: %s\n", detail);
+            if (msg_len < 0) { free(msg); pthread_mutex_unlock(&g_jobs_lock); return -1; }
+        }
+
+        job->task_id    = task_id;
+        job->output     = msg;
+        job->output_len = (uint32_t)msg_len;
+        job->status     = NAX_STATUS_ERR;
+        job->state      = NAX_JOB_COMPLETED;
+
+        pthread_mutex_unlock(&g_jobs_lock);
+        return idx;
+    }
 
     /* Find free slot */
     int idx = -1;
